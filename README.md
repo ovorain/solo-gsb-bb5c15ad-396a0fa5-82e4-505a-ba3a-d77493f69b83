@@ -18,6 +18,29 @@ DAG，工作器原子领取「所有前置均已成功」的任务，凭借唯�
   不留 DAG/任务/事件痕迹）；同一批内自相矛盾（同名组不同上限）返回 422。
   一次批量领取中新任务立即占位，已满的组会被**跳过并继续**寻找其他可领取任务
   （其他组或无组任务），尽量填满 `limit`。未声明组的任务行为完全不变。
+- **工作器能力路由**：`PUT /workers/{worker_id}` 登记工作器当前具备的**去重能力
+  标签**集合（`capabilities`，服务端去重排序）与正数存活时长 `ttl_seconds`，
+  返回去重后的能力、`registered_at`/`updated_at`/`expires_at` 与按当前时刻计算的
+  `alive`；`GET /workers/{worker_id}` 查询同一份登记与存活状态（从未登记返回
+  `404 worker_not_found`，已过期的登记仍可查到且 `alive=false`）。**重复 PUT
+  覆盖能力集合并刷新过期时间**（`expires_at = 本次时刻 + ttl_seconds`，
+  `registered_at` 保留首次值）。提交任务时可选声明 `requires`（能力标签数组，
+  同样去重排序后持久化）：**只有携带覆盖全部标签的存活登记 `worker_id` 的领取
+  才能匹配该任务**（`requires` 必须是登记能力集合的子集）。领取在**同一个
+  `BEGIN IMMEDIATE` 事务**内完成登记校验，并与依赖门控、退避时刻、并发组规则
+  **同时**满足才会领取：
+  - 携带 `worker_id` 但**登记缺失**（从未 PUT）→ `409 worker_not_registered`；
+  - 登记**已过 TTL**（`expires_at <= now`）→ `409 worker_registration_expired`；
+    两种情况都回滚整个领取事务，**绝不领取**任何任务（包括同批无 `requires`
+    的候选），重新 PUT 登记后续期即可恢复；
+  - 登记存活但**能力不匹配**的候选被**跳过并继续**向后扫描，尽量用后续可匹配
+    （或无 `requires`）的任务填满 `limit`（与并发组满时的跳过同理，不是错误）；
+  - **不带 `worker_id` 的匿名领取**跳过声明 `requires` 的候选（不返回 409），
+    未声明 `requires` 的历史任务领取行为完全不变；任务过期重领同样需要存活且
+    能力匹配的登记。
+  任务详情（`GET /tasks/{id}`）、DAG 任务列表与领取结果中的每个任务都返回
+  `requires`（未声明为 `null`）。能力登记持久化在 SQLite 的 `workers` 表中，
+  服务重启后存活登记仍然有效。
 - **递增 attempt 与唯一租约令牌**：每次领取生成新的 `attempt`（从 1 起递增）
   和新的随机 `lease_token`，并写入 attempts 历史。
 - **租约过期与旧令牌失效**：租约到期后任务可被再次领取（新尝试、新令牌）；
@@ -273,6 +296,89 @@ curl -i -X POST http://localhost:8000/dags -H 'Content-Type: application/json' -
 任务查询（`GET /tasks/{id}`、`GET /tasks`、`GET /dags/{id}`）在任务对象上返回
 `concurrency` 字段：有组时为 `{"group": "db-writers", "limit": 2}`，无组时为 `null`；
 领取响应中的每个任务也带 `concurrency_group`（无组为 `null`）。
+
+#### 工作器能力路由（PUT/GET /workers/{worker_id} + 任务 requires）
+
+需要「只有具备某种能力的工作器才能执行」的任务（GPU 推理、访问特定外部系统等）
+时，先由工作器登记自身能力与正数存活 TTL（秒）；标签在服务端去重排序：
+
+```bash
+# worker-gpu 具备 gpu + cpu 能力，登记 30 秒内存活
+curl -s -X PUT http://localhost:8000/workers/worker-gpu \
+  -H 'Content-Type: application/json' \
+  -d '{"capabilities": ["gpu", "cpu", "gpu"], "ttl_seconds": 30}'
+```
+
+```json
+{
+  "worker_id": "worker-gpu",
+  "capabilities": ["cpu", "gpu"],
+  "ttl_seconds": 30.0,
+  "registered_at": "2026-09-19T11:00:00Z",
+  "updated_at": "2026-09-19T11:00:00Z",
+  "expires_at": "2026-09-19T11:00:30Z",
+  "alive": true
+}
+```
+
+提交任务时用 `requires` 声明它需要的能力标签（去重排序后持久化）：
+
+```bash
+curl -s -X POST http://localhost:8000/dags -H 'Content-Type: application/json' -d '{
+  "tasks": [
+    {"key": "warmup"},
+    {"key": "infer", "requires": ["gpu"]},
+    {"key": "report", "requires": ["gpu", "cpu"]}
+  ]
+}'
+```
+
+领取规则（在领取的**同一事务**内校验，并与依赖、退避、并发组同时生效）：
+
+```bash
+# 1) 携带 worker_id 但从未登记 -> 409，且同批任何任务都不会被领取（事务整体回滚）
+curl -i -X POST http://localhost:8000/tasks/claim -H 'Content-Type: application/json' \
+  -d '{"worker_id": "worker-unknown", "limit": 10}'
+# HTTP/1.1 409
+# {"error":{"code":"worker_not_registered",
+#   "details":{"worker_id":"worker-unknown","requires":["gpu"]}}}
+
+# 2) 只有 cpu 能力的存活工作器：gpu 候选被跳过，继续领取无 requires 的 warmup
+curl -s -X PUT http://localhost:8000/workers/worker-cpu \
+  -H 'Content-Type: application/json' -d '{"capabilities": ["cpu"], "ttl_seconds": 30}' >/dev/null
+curl -s -X POST http://localhost:8000/tasks/claim -H 'Content-Type: application/json' \
+  -d '{"worker_id": "worker-cpu", "limit": 10}' | jq '.claimed[].task_key'
+# "warmup"
+
+# 3) 不带 worker_id 的匿名领取同样跳过 requires 候选（不返回 409）；
+#    未声明 requires 的历史任务行为完全不变
+curl -s -X POST http://localhost:8000/tasks/claim -H 'Content-Type: application/json' \
+  -d '{"limit": 10}' | jq '.claimed'
+# []
+
+# 4) 能力齐全的存活工作器：requires 是其能力集合的子集即可领取
+curl -s -X POST http://localhost:8000/tasks/claim -H 'Content-Type: application/json' \
+  -d '{"worker_id": "worker-gpu", "limit": 10}' | jq '.claimed[] | {task_key, requires}'
+# {"task_key": "infer",  "requires": ["gpu"]}
+# {"task_key": "report", "requires": ["cpu", "gpu"]}
+```
+
+- **TTL 心跳语义**：工作器应在 TTL 到期前**重复 PUT** 续期。重复登记**覆盖能力
+  集合**并把 `expires_at` 刷新为「当前时刻 + 新 ttl」（`registered_at` 保留首次
+  登记时刻，`updated_at` 为本次刷新时刻）；到期后未续期的登记 `alive=false`，
+  用它领取声明 `requires` 的任务返回 `409 worker_registration_expired`
+  （同样**整体回滚、不得领取**），重新 PUT 后立即可用。
+- 查询登记与存活状态；从未登记返回 `404 worker_not_found`（过期行仍返回 200）：
+
+```bash
+curl -s http://localhost:8000/workers/worker-gpu | jq '{capabilities, expires_at, alive}'
+# {"capabilities":["cpu","gpu"],"expires_at":"2026-09-19T11:00:30Z","alive":true}
+```
+
+- `ttl_seconds` 必须为正数（`0`/负数/非数字 → 422）；`capabilities` 与 `requires`
+  中的标签必须是非空字符串（空标签 → 422），`capabilities: []` 表示无能力工作器。
+- 任务详情与 DAG/列表视图均返回 `requires`（未声明或空列表为 `null`）；
+  领取响应中的每个任务也带 `requires`。
 
 ### 3. 续租（心跳）
 
@@ -620,7 +726,9 @@ curl -s http://localhost:8000/dags/<DAG_ID>/analysis | jq
 | `POST` | `/dags` | 提交 DAG（校验缺失依赖与环） |
 | `GET` | `/dags/{dag_id}` | DAG 概览：状态计数与任务列表 |
 | `GET` | `/dags/{dag_id}/analysis` | 只读分析：最早/最晚时间、总工期、关键路径与并行层级 |
-| `POST` | `/tasks/claim` | 原子领取前置全部成功的任务（跳过已满的跨 DAG 并发组，尽量填满 limit） |
+| `POST` | `/tasks/claim` | 原子领取前置全部成功的任务（同事务校验能力登记；跳过已满的并发组与能力不匹配候选，尽量填满 limit；登记缺失/过期 409 且不领取） |
+| `PUT` | `/workers/{worker_id}` | 登记去重能力标签与正数 ttl_seconds；重复登记覆盖能力并刷新过期时间 |
+| `GET` | `/workers/{worker_id}` | 查询工作器登记及存活状态（未登记 404，过期行 alive=false） |
 | `GET` | `/tasks?dag_id=&state=` | 任务列表（可过滤） |
 | `GET` | `/events?after=&limit=&dag_id=` | 不可变事件流：按 sequence 升序键集分页 |
 | `POST` | `/subscriptions` | 创建可靠事件订阅（保存 committed_sequence，可选 dag_id 过滤） |
@@ -687,4 +795,12 @@ OpenAPI 文档包含取消接口）、
 返回 409、ack 仅认当前令牌并把游标推进到该批最后一条 sequence、无在途批次/错误
 令牌返回 409 且游标不动、空批次无令牌不占槽位、不可能越过未确认事件、订阅列表与
 详情含在途 expired 状态、订阅/在途批次/游标重启后持久化且语义不变、与既有
-GET /events 及任务接口并存且行为不变、OpenAPI 文档包含订阅接口）。
+GET /events 及任务接口并存且行为不变、OpenAPI 文档包含订阅接口）、
+工作器能力路由（PUT 登记去重排序能力与正数 TTL 并返回存活状态、重复登记覆盖
+能力并刷新过期时间且保留 registered_at、GET 查询与 TTL 后 alive=false、未登记
+404、ttl/标签校验 422、任务 requires 提交去重排序并在详情/列表/领取结果返回、
+领取在同一事务内校验登记并同时满足依赖/退避/并发组、登记缺失 worker_not_registered
+与过期 worker_registration_expired 返回 409 且整批回滚不领取、能力不匹配跳过并
+继续填满 limit、子集匹配语义、匿名领取跳过 requires 且历史任务行为不变、
+重新登记后续期可领、重启后登记持久化、旧库迁移补 NULL requires、OpenAPI 文档
+包含工作器接口）。

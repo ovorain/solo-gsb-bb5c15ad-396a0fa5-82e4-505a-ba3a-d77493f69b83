@@ -45,12 +45,22 @@ class TaskIn(BaseModel):
         ge=1,
         description="同名组全局未过期 running 租约数上限（正整数）；须与 concurrency_group 同时提供",
     )
+    requires: list[str] | None = Field(
+        None,
+        description="能力要求标签列表（提交时去重）；非空时只有携带覆盖全部标签的存活能力登记的 worker_id 才能领取",
+    )
 
     @model_validator(mode="after")
     def _group_fields_must_come_together(self) -> "TaskIn":
         # 组名与上限要么同时给出，要么都不给出：只给其一是 422
         if (self.concurrency_group is None) != (self.concurrency_limit is None):
             raise ValueError("concurrency_group 与 concurrency_limit 必须同时提供")
+        return self
+
+    @model_validator(mode="after")
+    def _requires_labels_non_empty(self) -> "TaskIn":
+        if self.requires is not None and any(not isinstance(t, str) or not t for t in self.requires):
+            raise ValueError("requires 中的能力标签必须是非空字符串")
         return self
 
 
@@ -112,3 +122,24 @@ class SubscriptionAckIn(BaseModel):
         min_length=1,
         description="poll 返回的当前批次随机令牌；仅当前令牌可把游标推进到该批最后一条 sequence",
     )
+
+
+class WorkerRegisterIn(BaseModel):
+    """工作器能力登记：去重后的能力标签集合与正数存活 TTL（秒）。"""
+
+    capabilities: list[str] = Field(
+        ...,
+        description="工作器具备的能力标签列表（服务端去重排序）；空列表表示无能力",
+    )
+    ttl_seconds: float = Field(
+        ...,
+        gt=0,
+        allow_inf_nan=False,
+        description="登记存活时长（秒，必须为正）；到期后该工作器视为无登记，重复登记可刷新",
+    )
+
+    @model_validator(mode="after")
+    def _capability_labels_non_empty(self) -> "WorkerRegisterIn":
+        if any(not isinstance(label, str) or not label for label in self.capabilities):
+            raise ValueError("capabilities 中的能力标签必须是非空字符串")
+        return self

@@ -100,6 +100,11 @@ def init_db(path: Path | None = None) -> None:
                 -- 跨 DAG 并发组：NULL 表示不限流；非空时全库同名组内未过期
                 -- running 租约数不得超过 concurrency_groups 中持久化的上限。
                 concurrency_group   TEXT REFERENCES concurrency_groups(name),
+                -- 能力路由：任务所需能力标签的 JSON 数组（提交时去重排序）。
+                -- NULL 表示未声明 requires：任何领取（含不带 worker_id 的领取）
+                -- 都可匹配，与历史任务行为一致；非空时只有携带覆盖全部标签的
+                -- 存活登记（workers 行未过期）的 worker_id 才能领取该任务。
+                requires            TEXT,
                 UNIQUE(dag_id, task_key)
             );
 
@@ -197,6 +202,21 @@ def init_db(path: Path | None = None) -> None:
                 delivered_at       TEXT NOT NULL,
                 response_body      TEXT NOT NULL    -- 首次投递响应的原始 JSON 文本
             );
+
+            -- 工作器能力登记（能力路由）：一行一个 worker_id。
+            -- capabilities 为去重排序后的能力标签 JSON 数组；expires_at 为本次
+            -- 登记（PUT）时刻 + ttl_seconds。领取声明了 requires 的任务时，
+            -- 必须在领取事务内命中本行且 expires_at > 当前时刻，并要求
+            -- requires 标签集合是 capabilities 集合的子集。重复 PUT 覆盖能力集
+            -- 并把 expires_at 刷新到新的过期时刻（registered_at 保留首次时刻）。
+            CREATE TABLE IF NOT EXISTS workers (
+                worker_id        TEXT PRIMARY KEY,
+                capabilities     TEXT NOT NULL,   -- 去重排序后的能力标签 JSON 数组
+                ttl_seconds      REAL NOT NULL CHECK (ttl_seconds > 0),
+                registered_at    TEXT NOT NULL,   -- 首次登记时刻（重复登记不覆盖）
+                updated_at       TEXT NOT NULL,   -- 最近一次登记时刻
+                expires_at       TEXT NOT NULL    -- 最近一次登记的过期时刻（updated_at + ttl_seconds）
+            );
             """
         )
 
@@ -230,6 +250,10 @@ def init_db(path: Path | None = None) -> None:
             conn.execute("ALTER TABLE tasks ADD COLUMN backoff_max_seconds REAL")
         if "next_eligible_at" not in columns:
             conn.execute("ALTER TABLE tasks ADD COLUMN next_eligible_at TEXT")
+        # 旧库迁移：为已有任务补齐能力要求列。历史任务均未声明 requires，
+        # 默认 NULL —— 任何领取（含不带 worker_id）都可匹配，行为完全不变。
+        if "requires" not in columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN requires TEXT")
         conn.execute(
             """CREATE INDEX IF NOT EXISTS idx_tasks_group_occupancy
                    ON tasks(concurrency_group)

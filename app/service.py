@@ -267,12 +267,16 @@ def submit_dag(body: dict[str, Any]) -> dict[str, Any]:
                 lease = float(t.get("lease_seconds") or default_lease)
                 duration = float(t.get("duration_seconds") or default_duration)
                 backoff = t.get("retry_backoff")
+                # 能力要求：去重后排序固化（顺序无关、便于一致比较）；
+                # 未声明或空列表一律存 NULL（兼容历史领取行为）。
+                requires = sorted(set(t["requires"])) if t.get("requires") else None
                 conn.execute(
                     """INSERT INTO tasks (id, dag_id, task_key, name, payload,
                            max_retries, lease_seconds, duration_seconds, state, attempt,
                            created_at, concurrency_group,
-                           backoff_initial_seconds, backoff_multiplier, backoff_max_seconds)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)""",
+                           backoff_initial_seconds, backoff_multiplier, backoff_max_seconds,
+                           requires)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)""",
                     (
                         uuid.uuid4().hex,
                         dag_id,
@@ -288,6 +292,7 @@ def submit_dag(body: dict[str, Any]) -> dict[str, Any]:
                         float(backoff["initial_seconds"]) if backoff else None,
                         float(backoff["multiplier"]) if backoff else None,
                         float(backoff["max_seconds"]) if backoff else None,
+                        _dumps(requires),
                     ),
                 )
                 for dep in deps_map[key]:
@@ -351,6 +356,22 @@ def claim_tasks(worker_id: str | None, dag_id: str | None, limit: int) -> dict[s
     with get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")  # 保留锁：同一时刻只有一个领取者
         try:
+            # 工作器能力登记在领取事务内惰性加载（全批至多查询一次）：
+            # 只有候选声明了 requires 时才需要，未声明 requires 的历史任务
+            # 完全不触发登记查询，保持既有领取行为。
+            worker_row = None
+            worker_loaded = False
+
+            def load_worker_row():
+                nonlocal worker_row, worker_loaded
+                if not worker_loaded:
+                    if worker_id is not None:
+                        worker_row = conn.execute(
+                            "SELECT * FROM workers WHERE worker_id = ?", (worker_id,)
+                        ).fetchone()
+                    worker_loaded = True
+                return worker_row
+
             # 组名 -> 持久化上限（全库一致，从 concurrency_groups 取）
             limits: dict[str, int] = {
                 r["name"]: r["limit_value"]
@@ -394,6 +415,45 @@ def claim_tasks(worker_id: str | None, dag_id: str | None, limit: int) -> dict[s
                         # 组已满：跳过该候选（本批新领取的任务已即时计入 occupied），
                         # 继续寻找无组任务或其他仍有余量的组任务。
                         if occupied.get(group, 0) >= limits[group]:
+                            continue
+
+                    # 能力路由：依赖、退避、并发组均通过后，在同一事务内校验
+                    # 该候选的 requires。未声明 requires（NULL）的任务不触发
+                    # 任何登记校验——历史任务兼容现有领取行为（含匿名 worker）。
+                    requires = json.loads(row["requires"]) if row["requires"] else None
+                    if requires:
+                        reg = load_worker_row()
+                        if worker_id is None or reg is None:
+                            if worker_id is None:
+                                # 匿名领取（未携带 worker_id）：没有可校验的存活
+                                # 登记，跳过声明 requires 的候选并继续向后扫描，
+                                # 未声明 requires 的历史任务领取行为完全不变。
+                                continue
+                            # 携带 worker_id 但查无登记：不得领取任何声明 requires
+                            # 的任务——回滚本事务，绝不部分领取。
+                            raise APIError(
+                                409,
+                                "worker_not_registered",
+                                f"工作器 {worker_id} 未进行能力登记，无法领取声明 requires 的任务",
+                                {"worker_id": worker_id, "requires": requires},
+                            )
+                        reg_expires = _parse(reg["expires_at"])
+                        if reg_expires is None or reg_expires <= now:
+                            # 登记已过 TTL：与缺失同样处理，409 且不得领取
+                            raise APIError(
+                                409,
+                                "worker_registration_expired",
+                                f"工作器 {worker_id} 的能力登记已过期，请重新登记后再领取",
+                                {
+                                    "worker_id": worker_id,
+                                    "expires_at": reg["expires_at"],
+                                    "requires": requires,
+                                },
+                            )
+                        caps = set(json.loads(reg["capabilities"]))
+                        if not set(requires) <= caps:
+                            # 存活但能力不匹配：跳过该候选并继续向后扫描，
+                            # 尽量用后续可匹配任务填满 limit（与组满跳过同理）。
                             continue
 
                     attempt_no = row["attempt"] + 1
@@ -447,6 +507,7 @@ def claim_tasks(worker_id: str | None, dag_id: str | None, limit: int) -> dict[s
                             "lease_expires_at": _iso(expires),
                             "lease_seconds": row["lease_seconds"],
                             "concurrency_group": group,
+                            "requires": requires,
                         }
                     )
                     if len(claimed) >= limit:
@@ -1019,6 +1080,75 @@ def cancel_task(task_id: str) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------- 工作器能力登记
+
+def _worker_dict(row) -> dict[str, Any]:
+    """workers 行 -> 对外工作器视图；alive 按当前时刻动态计算。"""
+    expires = _parse(row["expires_at"])
+    return {
+        "worker_id": row["worker_id"],
+        # 去重排序后的能力标签（重复登记按最新提交覆盖）
+        "capabilities": json.loads(row["capabilities"]),
+        "ttl_seconds": row["ttl_seconds"],
+        "registered_at": row["registered_at"],
+        "updated_at": row["updated_at"],
+        "expires_at": row["expires_at"],
+        # 存活判定与领取事务内一致：expires_at > 当前时刻
+        "alive": expires is not None and expires > _now(),
+    }
+
+
+def register_worker(worker_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    """登记（或刷新）工作器能力：去重标签集合 + 正数 TTL。
+
+    单事务 UPSERT：首次登记写入 registered_at；重复登记覆盖 capabilities 与
+    ttl_seconds，并把 updated_at/expires_at 刷新为当前时刻/当前时刻+ttl
+    （registered_at 保留首次值）。返回的视图带按当前时刻计算的 alive。
+    """
+    capabilities = sorted(set(body["capabilities"]))  # 去重排序：顺序无关
+    ttl_seconds = float(body["ttl_seconds"])
+    now = _now()
+    now_iso = _iso(now)
+    expires_iso = _iso(now + timedelta(seconds=ttl_seconds))
+
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                """INSERT INTO workers (worker_id, capabilities, ttl_seconds,
+                       registered_at, updated_at, expires_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(worker_id) DO UPDATE SET
+                       capabilities = excluded.capabilities,
+                       ttl_seconds = excluded.ttl_seconds,
+                       updated_at = excluded.updated_at,
+                       expires_at = excluded.expires_at""",
+                (
+                    worker_id,
+                    _dumps(capabilities),
+                    ttl_seconds,
+                    now_iso,
+                    now_iso,
+                    expires_iso,
+                ),
+            )
+            row = conn.execute("SELECT * FROM workers WHERE worker_id = ?", (worker_id,)).fetchone()
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        return _worker_dict(row)
+
+
+def get_worker(worker_id: str) -> dict[str, Any]:
+    """查询工作器登记与当前存活状态；从未登记返回 404（过期行仍可查，alive=false）。"""
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM workers WHERE worker_id = ?", (worker_id,)).fetchone()
+        if row is None:
+            raise APIError(404, "worker_not_found", f"工作器 {worker_id} 尚未登记")
+        return _worker_dict(row)
+
+
 # ---------------------------------------------------------------- 状态查询
 
 def _attempts(conn, task_id: str) -> list[dict[str, Any]]:
@@ -1111,6 +1241,8 @@ def _task_dict(conn, row, with_attempts: bool = True, group_limits: dict[str, in
         "lease": lease,
         "blocked_reason": row["blocked_reason"],
         "concurrency": concurrency,
+        # 能力要求标签（提交时去重排序）；未声明 requires 的历史任务为 null
+        "requires": json.loads(row["requires"]) if row["requires"] else None,
         "created_at": row["created_at"],
         "started_at": row["started_at"],
         "finished_at": row["finished_at"],

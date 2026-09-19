@@ -20,6 +20,7 @@ from .schemas import (
     SubscriptionAckIn,
     SubscriptionIn,
     SubscriptionPollIn,
+    WorkerRegisterIn,
 )
 
 
@@ -73,6 +74,32 @@ def claim_tasks(body: ClaimIn) -> dict:
 @app.get("/tasks")
 def list_tasks(dag_id: str | None = None, state: str | None = None) -> dict:
     return service.list_tasks(dag_id, state)
+
+
+# ------------------------------------------------------- 工作器能力路由
+
+@app.put(
+    "/workers/{worker_id}",
+    summary="登记（或刷新）工作器能力标签与正数存活 TTL",
+    responses={
+        200: {"description": "登记成功：能力标签去重排序后持久化，expires_at 已刷新；重复登记覆盖能力并续期"},
+        422: {"description": "请求体非法：ttl_seconds 非正或能力标签含空字符串"},
+    },
+)
+def register_worker(worker_id: str, body: WorkerRegisterIn) -> dict:
+    return service.register_worker(worker_id, body.model_dump())
+
+
+@app.get(
+    "/workers/{worker_id}",
+    summary="查询工作器登记及当前存活状态",
+    responses={
+        200: {"description": "返回能力标签、登记/最近更新/过期时刻与 alive（过期行仍返回，alive=false）"},
+        404: {"description": "工作器从未登记（worker_not_found）"},
+    },
+)
+def get_worker(worker_id: str) -> dict:
+    return service.get_worker(worker_id)
 
 
 @app.get("/events")
