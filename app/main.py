@@ -20,6 +20,7 @@ from .schemas import (
     SubscriptionAckIn,
     SubscriptionIn,
     SubscriptionPollIn,
+    WorkerRegisterIn,
 )
 
 
@@ -31,8 +32,8 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="Dependency-Aware Task Lease API",
-    version="1.0.0",
-    description="提交 DAG、原子领取前置已完成的任务、基于租约令牌回报结果。",
+    version="1.1.0",
+    description="提交 DAG、原子领取前置已完成的任务、基于租约令牌回报结果；支持工作器能力登记与 requires 能力路由。",
     lifespan=lifespan,
 )
 
@@ -65,9 +66,43 @@ def analyze_dag(dag_id: str) -> dict:
     return service.analyze_dag(dag_id)
 
 
-@app.post("/tasks/claim")
+@app.post(
+    "/tasks/claim",
+    summary="原子领取前置已完成的任务",
+    responses={
+        200: {"description": "返回本次领取到的任务（依赖、退避、并发组与能力门控均满足）"},
+        404: {"description": "指定的 dag_id 不存在（dag_not_found）"},
+        409: {"description": "候选含 requires 任务但 worker_id 登记缺失或已过期（worker_not_registered），不领取任何任务"},
+    },
+)
 def claim_tasks(body: ClaimIn) -> dict:
     return service.claim_tasks(body.worker_id, body.dag_id, body.limit)
+
+
+# ------------------------------------------------------- 工作器能力登记（能力路由）
+
+@app.put(
+    "/workers/{worker_id}",
+    summary="登记或刷新工作器能力（去重标签 + 正数 ttl_seconds）",
+    responses={
+        200: {"description": "登记已保存/覆盖；重复 PUT 覆盖能力并刷新过期时刻，返回当前存活状态"},
+        422: {"description": "capabilities 含非空字符串之外的元素，或 ttl_seconds 非正"},
+    },
+)
+def register_worker(worker_id: str, body: WorkerRegisterIn) -> dict:
+    return service.register_worker(worker_id, body.model_dump())
+
+
+@app.get(
+    "/workers/{worker_id}",
+    summary="查询工作器登记与存活状态",
+    responses={
+        200: {"description": "返回能力标签、ttl、首次登记时刻、过期时刻与 alive"},
+        404: {"description": "工作器从未登记（worker_not_found）"},
+    },
+)
+def get_worker(worker_id: str) -> dict:
+    return service.get_worker(worker_id)
 
 
 @app.get("/tasks")

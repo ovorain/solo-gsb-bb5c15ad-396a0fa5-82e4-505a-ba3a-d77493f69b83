@@ -18,6 +18,24 @@ DAG，工作器原子领取「所有前置均已成功」的任务，凭借唯�
   不留 DAG/任务/事件痕迹）；同一批内自相矛盾（同名组不同上限）返回 422。
   一次批量领取中新任务立即占位，已满的组会被**跳过并继续**寻找其他可领取任务
   （其他组或无组任务），尽量填满 `limit`。未声明组的任务行为完全不变。
+- **工作器能力登记与能力路由**：工作器通过 `PUT /workers/{worker_id}` 登记
+  **去重后的能力标签**（`capabilities`，按首次出现顺序持久化，空数组合法）与
+  **正数** `ttl_seconds`（登记存活时长，非正返回 422）。重复 PUT 是覆盖语义：
+  **整体替换能力标签并刷新过期时刻**（`registered_at` 保留首次登记时间）。
+  `GET /workers/{worker_id}` 查询登记内容与实时 `alive`（`expires_at >= now`），
+  从未登记返回 `404 worker_not_found`；过期登记行仍可查询，只是 `alive: false`。
+  任务提交时可选声明 `requires: ["标签", …]`（同样去重持久化；空数组或缺省表示
+  **不要求能力**）。领取时该候选必须**同时**满足依赖门控、退避时刻、并发组容量与
+  能力门控：能力校验在领取的**同一 `BEGIN IMMEDIATE` 事务**内进行（
+  `requires` 与 worker 登记取同一事务的一致状态），领取者须携带**存活**登记的
+  `worker_id` 且其 `capabilities` **覆盖全部** requires 标签（超集即可，标签
+  区分大小写与空格）。**能力不匹配的候选被跳过，领取继续向后寻找其他任务填满
+  `limit`**（与满并发组同样的跳过语义）；**登记缺失或已过期（含匿名领取）时，
+  一旦存在依赖/退避/并发组门控均满足、仅缺能力登记的候选，整次领取返回
+  `409 worker_not_registered` 且不领取任何任务**（同事务回滚；details 携带
+  `worker_id`/`requires`/`task_id`/`task_key`/`dag_id`）。任务详情、DAG/任务列表
+  与领取结果均返回 `requires`（未声明为空数组）；**未声明 `requires` 的历史任务
+  完全兼容现有领取行为**——匿名、无登记或登记过期的 worker_id 都能领取。
 - **递增 attempt 与唯一租约令牌**：每次领取生成新的 `attempt`（从 1 起递增）
   和新的随机 `lease_token`，并写入 attempts 历史。
 - **租约过期与旧令牌失效**：租约到期后任务可被再次领取（新尝试、新令牌）；
@@ -274,7 +292,89 @@ curl -i -X POST http://localhost:8000/dags -H 'Content-Type: application/json' -
 `concurrency` 字段：有组时为 `{"group": "db-writers", "limit": 2}`，无组时为 `null`；
 领取响应中的每个任务也带 `concurrency_group`（无组为 `null`）。
 
-### 3. 续租（心跳）
+### 3. 工作器能力登记与能力路由（workers / requires）
+
+需要「只有具备某种能力的工作器才能领取某类任务」时（例如只有 GPU 机器能跑训练、
+只有持有证书的进程能访问外部系统），先让工作器**登记能力**，再在提交任务时用
+`requires` 声明标签。
+
+登记/刷新工作器能力（标签自动去重，`ttl_seconds` 必须为正数）：
+
+```bash
+# w-gpu 具备 gpu 能力，登记 60 秒内存活
+curl -s -X PUT http://localhost:8000/workers/w-gpu \
+  -H 'Content-Type: application/json' \
+  -d '{"capabilities": ["gpu"], "ttl_seconds": 60}'
+# {
+#   "worker_id": "w-gpu", "capabilities": ["gpu"], "ttl_seconds": 60.0,
+#   "registered_at": "2026-09-19T10:00:00Z",
+#   "expires_at": "2026-09-19T10:01:00Z", "alive": true
+# }
+
+# 查询登记与存活状态（从未登记 -> 404 worker_not_found；过期行仍返回 alive=false）
+curl -s http://localhost:8000/workers/w-gpu
+
+# 重复 PUT 覆盖能力并刷新过期时刻（registered_at 不变，expires_at 顺延）
+curl -s -X PUT http://localhost:8000/workers/w-gpu \
+  -H 'Content-Type: application/json' \
+  -d '{"capabilities": ["gpu", "io"], "ttl_seconds": 60}'
+```
+
+提交带能力要求的任务（标签同样去重）：
+
+```bash
+curl -s -X POST http://localhost:8000/dags -H 'Content-Type: application/json' -d '{
+  "id": "cap-dag",
+  "tasks": [
+    {"key": "prepare"},
+    {"key": "train",  "deps": ["prepare"], "requires": ["gpu"]},
+    {"key": "export", "deps": ["train"],   "requires": ["gpu", "io"]}
+  ]
+}'
+```
+
+领取语义（能力校验与依赖、退避、并发组在**同一事务**内完成）：
+
+```bash
+# 匿名/未登记领取：候选中存在 requires 任务（其余门控已满足）-> 409，整批不领取
+curl -i -X POST http://localhost:8000/tasks/claim -H 'Content-Type: application/json' \
+  -d '{"limit": 10}'
+# HTTP/1.1 409
+# {"error":{"code":"worker_not_registered",
+#   "details":{"worker_id":null,"requires":["gpu"],"task_key":"train", …}}}
+
+# 只有 gpu 能力：prepare/train 可领；export 要求 gpu+io，能力不匹配被跳过，
+# 领取继续向后寻找其他可领任务填满 limit（不会因 export 卡住整批）
+curl -s -X POST http://localhost:8000/tasks/claim -H 'Content-Type: application/json' \
+  -d '{"worker_id": "w-gpu", "limit": 10}' | jq '.claimed[].task_key'
+# "prepare"
+# "train"
+
+# 工作器续登覆盖为 [gpu, io] 后，export 即可被领取
+curl -s -X PUT http://localhost:8000/workers/w-gpu -H 'Content-Type: application/json' \
+  -d '{"capabilities": ["gpu", "io"], "ttl_seconds": 60}'
+curl -s -X POST http://localhost:8000/tasks/claim -H 'Content-Type: application/json' \
+  -d '{"worker_id": "w-gpu"}' | jq '.claimed[].task_key'
+# "export"
+```
+
+- `requires` 为空/缺省的任务**不做能力校验**：任何 worker_id（含匿名、无登记、
+  登记过期）都可领取，与历史行为完全一致；旧版 SQLite 库迁移后历史任务
+  `requires` 为空数组。
+- 能力超集即可匹配：worker 持有 `["gpu","io","cpu"]` 可领取 `requires: ["gpu"]`
+  的任务；标签区分大小写与前后空格（`"GPU"` ≠ `"gpu"`）。
+- 登记过期（超过 `expires_at` 未续登）后领取 requires 任务同样返回
+  `409 worker_not_registered`；过期前重新 PUT 可不断刷新存活窗口。
+- 被依赖、退避或满并发组挡住的 requires 任务**不在**可领取候选内，不会触发
+  409（门控顺序：依赖/退避 → 并发组容量 → 能力）。
+- 领取结果与任务详情均携带 `requires`：
+
+```bash
+curl -s http://localhost:8000/tasks/<TASK_ID> | jq '{key, requires, state}'
+# {"key":"train","requires":["gpu"],"state":"running"}
+```
+
+### 4. 续租（心跳）
 
 任务可能运行超过租约时长时，在到期前凭当前令牌续租：
 
@@ -287,7 +387,7 @@ curl -s -X POST http://localhost:8000/tasks/<TASK_ID>/heartbeat \
 租约过期并被他人重新领取后，再用旧令牌续租会得到 `409 lease_expired` /
 `409 invalid_lease`。
 
-### 4. 回报结果
+### 5. 回报结果
 
 回报必须携带客户端生成的幂等键 `completion_id`（建议用 UUID 等全局唯一值）：
 
@@ -342,7 +442,7 @@ curl -s http://localhost:8000/tasks/<TASK_ID> | jq '{state, retry_backoff, next_
 > 租约过期后旧令牌**首次**使用新 `completion_id` 的回报返回 **409**，
 > 不会作用于已开始的新尝试；只有曾成功生效过的幂等键才会回放首次响应。
 
-### 5. 恢复最终失败的任务
+### 6. 恢复最终失败的任务
 
 重试耗尽进入 `failed` 的任务可以恢复回 `pending` 重新参与调度；被它连累阻塞的
 后继会在**同一事务**内按依赖图递归检查，全部前置均已 `succeeded` 或 `pending`
@@ -367,7 +467,7 @@ curl -s -X POST http://localhost:8000/tasks/<TASK_ID>/resume
 - 恢复与解锁的每个状态变更都会在同一事务内追加 `task.resumed` 事件
   （根任务 `failed → pending`，被解锁后继 `blocked → pending`）。
 
-### 6. 取消任务
+### 7. 取消任务
 
 取消 `pending`/`running`/`blocked` 任务；正在运行的任务会被立即终止，所有尚未
 结束的后继在同一事务内连锁取消：
@@ -390,7 +490,7 @@ curl -s -X POST http://localhost:8000/tasks/<TASK_ID>/cancel
 - 每个实际状态变更在同一事务内追加 `task.canceled` 事件
   （如 `running → canceled`、`blocked → canceled`）。
 
-### 7. 状态查询
+### 8. 状态查询
 
 ```bash
 # DAG 概览（状态计数 + 任务列表，含阻塞原因）
@@ -429,7 +529,7 @@ curl -s 'http://localhost:8000/tasks?state=blocked'
 "next_eligible_at": "2026-09-18T11:00:02Z", "lease": null}`；
 未配置退避时 `retry_backoff` 与 `next_eligible_at` 均为 `null`。
 
-### 8. 事件流
+### 9. 事件流
 
 事件流只增不改，记录全部关键状态变迁。每条事件形如：
 
@@ -489,7 +589,7 @@ curl -s 'http://localhost:8000/events?after=0&limit=50'
 curl -s 'http://localhost:8000/events?dag_id=<DAG_ID>&after=0&limit=100'
 ```
 
-### 9. 可靠事件订阅（投递 / 确认）
+### 10. 可靠事件订阅（投递 / 确认）
 
 `GET /events` 适合临时翻页；需要「至少一次、不跳过、可重放」的持续消费时使用订阅。
 订阅在创建时固化起始游标 `committed_sequence`（默认 `0`），可选 `dag_id` 过滤：
@@ -561,7 +661,7 @@ curl -s 'http://localhost:8000/subscriptions?dag_id=<DAG_ID>'
 curl -s http://localhost:8000/subscriptions/$SID
 ```
 
-### 10. 只读分析（关键路径）
+### 11. 只读分析（关键路径）
 
 按任务声明的 `duration_seconds`（缺省 1）对整个 DAG 做关键路径分析，
 与任务当前运行状态无关，纯粹回答「如果现在开始，理想排程长什么样」：
@@ -620,7 +720,9 @@ curl -s http://localhost:8000/dags/<DAG_ID>/analysis | jq
 | `POST` | `/dags` | 提交 DAG（校验缺失依赖与环） |
 | `GET` | `/dags/{dag_id}` | DAG 概览：状态计数与任务列表 |
 | `GET` | `/dags/{dag_id}/analysis` | 只读分析：最早/最晚时间、总工期、关键路径与并行层级 |
-| `POST` | `/tasks/claim` | 原子领取前置全部成功的任务（跳过已满的跨 DAG 并发组，尽量填满 limit） |
+| `POST` | `/tasks/claim` | 原子领取前置全部成功的任务（同事务校验能力登记；跳过满并发组与能力不匹配候选，尽量填满 limit；登记缺失/过期 409） |
+| `PUT` | `/workers/{worker_id}` | 登记/刷新工作器能力：去重能力标签 + 正数 ttl_seconds；重复 PUT 覆盖能力并刷新过期时刻 |
+| `GET` | `/workers/{worker_id}` | 查询登记内容与 alive 存活状态；从未登记 404 |
 | `GET` | `/tasks?dag_id=&state=` | 任务列表（可过滤） |
 | `GET` | `/events?after=&limit=&dag_id=` | 不可变事件流：按 sequence 升序键集分页 |
 | `POST` | `/subscriptions` | 创建可靠事件订阅（保存 committed_sequence，可选 dag_id 过滤） |
@@ -660,6 +762,14 @@ pytest -q
 ```
 
 测试覆盖：DAG 校验（缺失依赖/环/重复键）、依赖门控、并发原子领取、
+工作器能力登记与能力路由（PUT 去重标签/正数 TTL 校验、GET 查询与 404、
+重复 PUT 覆盖能力并刷新过期时刻且保留首次 registered_at、TTL 过期 alive=false、
+任务 requires 去重并在 DAG/列表/详情/领取结果返回、登记缺失/过期（含匿名）
+领取 requires 候选返回 409 且整批不领取也不产生事件、存活但能力不匹配跳过并继续
+填满 limit、超集匹配、标签大小写/空格敏感、能力门控与依赖/退避/并发组的优先级
+（依赖未满足/退避未到期/组满时不触发 409、组满跳过先于能力门控）、无 requires
+历史任务对匿名/过期登记 worker 完全兼容、租约过期重领同样校验登记、登记与 requires
+重启后持久化、旧库迁移补 requires NULL 且 workers 表可用、OpenAPI 文档包含新接口）、
 跨 DAG 并发组（字段必须成对且为正整数、组容量占用与同批即时占位、满组跳过继续填满
 limit、跨 DAG 共享容量、同名组上限持久化一致与冲突整批回滚、成功/失败/过期释放名额、
 心跳续租保持占用、重启后上限与限流仍生效、无组任务不受影响、旧库迁移补 NULL）、

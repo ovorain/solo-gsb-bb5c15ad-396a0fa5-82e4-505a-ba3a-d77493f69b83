@@ -181,6 +181,8 @@ def submit_dag(body: dict[str, Any]) -> dict[str, Any]:
         seen.add(key)
         keys.append(key)
         deps_map[key] = list(dict.fromkeys(t.get("deps") or []))
+        # 能力标签与依赖同口径去重（按首次出现顺序）；空声明视为不要求能力（NULL）
+        t["requires"] = list(dict.fromkeys(t.get("requires") or [])) or None
         tasks_by_key[key] = t
 
     if duplicates:
@@ -270,9 +272,9 @@ def submit_dag(body: dict[str, Any]) -> dict[str, Any]:
                 conn.execute(
                     """INSERT INTO tasks (id, dag_id, task_key, name, payload,
                            max_retries, lease_seconds, duration_seconds, state, attempt,
-                           created_at, concurrency_group,
+                           created_at, concurrency_group, requires,
                            backoff_initial_seconds, backoff_multiplier, backoff_max_seconds)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)""",
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)""",
                     (
                         uuid.uuid4().hex,
                         dag_id,
@@ -285,6 +287,7 @@ def submit_dag(body: dict[str, Any]) -> dict[str, Any]:
                         PENDING,
                         now,
                         t.get("concurrency_group"),
+                        _dumps(t.get("requires")),
                         float(backoff["initial_seconds"]) if backoff else None,
                         float(backoff["multiplier"]) if backoff else None,
                         float(backoff["max_seconds"]) if backoff else None,
@@ -351,6 +354,18 @@ def claim_tasks(worker_id: str | None, dag_id: str | None, limit: int) -> dict[s
     with get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")  # 保留锁：同一时刻只有一个领取者
         try:
+            # 能力路由：领取者的能力登记必须在同一保留事务内核验（与依赖、退避、
+            # 并发组规则一样取同一事务内的一致状态）。worker 为 None 表示匿名领取。
+            worker_row = None
+            worker_caps: set[str] | None = None
+            if worker_id is not None:
+                worker_row = conn.execute(
+                    "SELECT * FROM workers WHERE worker_id = ?", (worker_id,)
+                ).fetchone()
+                if worker_row is not None and worker_row["expires_at"] >= now_iso:
+                    worker_caps = set(json.loads(worker_row["capabilities"]))
+                # 登记缺失或过期时 worker_caps 保持 None：遇到要求能力的候选即 409
+
             # 组名 -> 持久化上限（全库一致，从 concurrency_groups 取）
             limits: dict[str, int] = {
                 r["name"]: r["limit_value"]
@@ -389,11 +404,41 @@ def claim_tasks(worker_id: str | None, dag_id: str | None, limit: int) -> dict[s
 
                 for row in rows:
                     after_rowid = row["rowid"]
+
+                    # 并发组容量与依赖/退避同属「该候选此刻是否可领取」的门控（依赖、
+                    # 退避已在 SQL 内过滤；组容量在 Python 侧逐候选跳过）。组已满的
+                    # 候选对任何领取者都不可得，先于能力门控跳过。
                     group = row["concurrency_group"]
                     if group is not None:
                         # 组已满：跳过该候选（本批新领取的任务已即时计入 occupied），
                         # 继续寻找无组任务或其他仍有余量的组任务。
                         if occupied.get(group, 0) >= limits[group]:
+                            continue
+
+                    # 能力门控（在同事务内核验登记，与依赖/退避/并发组一起裁决）：
+                    # 声明了 requires 的候选要求领取者持有存活登记且覆盖全部标签。
+                    required = json.loads(row["requires"]) if row["requires"] else []
+                    if required:
+                        if worker_caps is None:
+                            # 登记缺失或已过期（含匿名领取）且该候选其余门控均已满足：
+                            # 整次领取 409 且不领取任何任务——无能力要求的候选同样
+                            # 不得在本次领取中获得（本事务回滚）。
+                            raise APIError(
+                                409,
+                                "worker_not_registered",
+                                "要求能力的任务只能由持有存活能力登记的工作器领取",
+                                {
+                                    "worker_id": worker_id,
+                                    "requires": required,
+                                    "task_id": row["id"],
+                                    "task_key": row["task_key"],
+                                    "dag_id": row["dag_id"],
+                                },
+                            )
+                        if not set(required) <= worker_caps:
+                            # 登记存活但能力不覆盖：跳过该候选，继续向后寻找其他
+                            # 任务（无能力要求任务或标签被覆盖的任务）填满 limit，
+                            # 不消耗并发组名额
                             continue
 
                     attempt_no = row["attempt"] + 1
@@ -447,6 +492,7 @@ def claim_tasks(worker_id: str | None, dag_id: str | None, limit: int) -> dict[s
                             "lease_expires_at": _iso(expires),
                             "lease_seconds": row["lease_seconds"],
                             "concurrency_group": group,
+                            "requires": required,
                         }
                     )
                     if len(claimed) >= limit:
@@ -461,6 +507,67 @@ def claim_tasks(worker_id: str | None, dag_id: str | None, limit: int) -> dict[s
             raise
 
     return {"claimed": claimed, "count": len(claimed)}
+
+
+# ---------------------------------------------------------------- 工作器能力登记
+
+def _worker_dict(row, now_iso: str | None = None) -> dict[str, Any]:
+    """workers 行 -> 对外登记视图；alive 按当前时刻动态计算（与租约/订阅视图同口径）。"""
+    now_iso = now_iso or _iso(_now())
+    return {
+        "worker_id": row["worker_id"],
+        "capabilities": json.loads(row["capabilities"]),
+        "ttl_seconds": row["ttl_seconds"],
+        "registered_at": row["registered_at"],
+        "expires_at": row["expires_at"],
+        # 到期判定与领取一致：expires_at >= now 视为存活，过期行仍可查询
+        "alive": row["expires_at"] >= now_iso,
+    }
+
+
+def register_worker(worker_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    """登记/刷新工作器能力：UPSERT，重复登记覆盖能力并刷新过期时刻。
+
+    能力标签按首次出现顺序去重（与任务依赖/requires 的去重口径一致）。
+    ttl_seconds 必须为正（请求模型已校验）。registered_at 保留首次登记时刻，
+    expires_at 以本次 PUT 时刻 + ttl 覆盖刷新。
+    """
+    capabilities = list(dict.fromkeys(body["capabilities"]))
+    ttl = float(body["ttl_seconds"])
+    now = _now()
+    now_iso = _iso(now)
+    expires_iso = _iso(now + timedelta(seconds=ttl))
+
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                """INSERT INTO workers (worker_id, capabilities, ttl_seconds, registered_at, expires_at)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(worker_id) DO UPDATE SET
+                       capabilities = excluded.capabilities,
+                       ttl_seconds = excluded.ttl_seconds,
+                       expires_at = excluded.expires_at""",
+                (worker_id, _dumps(capabilities), ttl, now_iso, expires_iso),
+            )
+            row = conn.execute(
+                "SELECT * FROM workers WHERE worker_id = ?", (worker_id,)
+            ).fetchone()
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        return _worker_dict(row, now_iso)
+
+
+def get_worker(worker_id: str) -> dict[str, Any]:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM workers WHERE worker_id = ?", (worker_id,)
+        ).fetchone()
+        if row is None:
+            raise APIError(404, "worker_not_found", f"工作器 {worker_id} 尚未登记")
+        return _worker_dict(row)
 
 
 # ---------------------------------------------------------------- 租约工具
@@ -1111,6 +1218,8 @@ def _task_dict(conn, row, with_attempts: bool = True, group_limits: dict[str, in
         "lease": lease,
         "blocked_reason": row["blocked_reason"],
         "concurrency": concurrency,
+        # 能力要求标签：未声明（NULL）或空数组一律返回空数组，声明则按持久化顺序返回
+        "requires": json.loads(row["requires"]) if row["requires"] else [],
         "created_at": row["created_at"],
         "started_at": row["started_at"],
         "finished_at": row["finished_at"],

@@ -2667,3 +2667,450 @@ def test_existing_events_endpoint_still_works_alongside_subscriptions(client):
     events = client.get("/events", params={"after": 0, "limit": 100}).json()
     assert len(events["events"]) == len(p["events"])
     assert [e["sequence"] for e in events["events"]] == [e["sequence"] for e in p["events"]]
+
+
+# ------------------------------------------------------------- 工作器能力登记（能力路由）
+
+def register(client, worker_id, capabilities, ttl=60):
+    return client.put(f"/workers/{worker_id}",
+                      json={"capabilities": capabilities, "ttl_seconds": ttl})
+
+
+def _requires_dag(client, dag_id="cap-1", tasks=None):
+    default_tasks = [
+        {"key": "plain"},
+        {"key": "gpu", "requires": ["gpu"]},
+        {"key": "both", "requires": ["gpu", "io"]},
+    ]
+    return submit(client, tasks if tasks is not None else default_tasks, dag_id=dag_id)
+
+
+def test_register_worker_persists_dedup_and_ttl(client):
+    r = register(client, "w-1", ["gpu", "io", "gpu", "cpu"], ttl=10)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["worker_id"] == "w-1"
+    # 标签按首次出现顺序去重
+    assert body["capabilities"] == ["gpu", "io", "cpu"]
+    assert body["ttl_seconds"] == 10
+    assert body["alive"] is True
+    assert body["registered_at"]
+    assert body["expires_at"]
+    assert _parse_iso(body["expires_at"]) > _parse_iso(body["registered_at"])
+
+    # GET 返回相同登记与存活状态
+    got = client.get("/workers/w-1")
+    assert got.status_code == 200
+    assert got.json() == body
+
+
+def test_register_get_unknown_returns_404(client):
+    r = client.get("/workers/nope")
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "worker_not_found"
+
+
+def test_register_rejects_non_positive_ttl_and_blank_tags(client):
+    for bad_ttl in (0, -1):
+        r = register(client, f"w-ttl-{bad_ttl}", ["gpu"], ttl=bad_ttl)
+        assert r.status_code == 422, bad_ttl
+    # NaN/Inf 非法：直接在请求模型层校验（FastAPI 默认 422 响应体需回显该输入，
+    # NaN 无法被 JSON 序列化，故此处不走 HTTP 文本）
+    import pydantic
+
+    from app.schemas import WorkerRegisterIn
+
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(pydantic.ValidationError):
+            WorkerRegisterIn(capabilities=["gpu"], ttl_seconds=bad)
+    # 能力标签必须是非空字符串
+    assert register(client, "w-empty", [], ttl=10).status_code == 200  # 空能力集合合法
+    # 空字符串标签非法；非字符串标签非法
+    assert register(client, "w-blank", [""], ttl=10).status_code == 422
+    r = register(client, "w-badtag", [1], ttl=10)
+    assert r.status_code == 422
+    r = client.put("/workers/w-x", json={"ttl_seconds": 10})  # 缺 capabilities
+    assert r.status_code == 422
+
+
+def test_repeat_put_overwrites_caps_and_refreshes_expiry(client):
+    r1 = register(client, "w-1", ["gpu", "io"], ttl=0.3)
+    first = r1.json()
+    assert first["capabilities"] == ["gpu", "io"]
+
+    time.sleep(0.15)
+    # 重复登记：覆盖能力（丢弃 io）、刷新过期时刻；registered_at 保留首次值
+    r2 = register(client, "w-1", ["gpu"], ttl=30)
+    second = r2.json()
+    assert second["capabilities"] == ["gpu"]
+    assert second["ttl_seconds"] == 30
+    assert second["registered_at"] == first["registered_at"]
+    assert _parse_iso(second["expires_at"]) > _parse_iso(first["expires_at"])
+    assert second["alive"] is True
+
+    # 初次登记本已接近过期，刷新后仍然存活
+    time.sleep(0.25)
+    assert client.get("/workers/w-1").json()["alive"] is True
+
+    # 空能力集合同样是覆盖语义
+    r3 = register(client, "w-1", [], ttl=30)
+    assert r3.json()["capabilities"] == []
+
+
+def test_worker_alive_false_after_ttl_and_ttl_refresh_keeps_alive(client):
+    register(client, "w-ttl", ["gpu"], ttl=0.3)
+    time.sleep(0.15)
+    # 过期前重新登记刷新 TTL，不会过期
+    register(client, "w-ttl", ["gpu"], ttl=0.3)
+    time.sleep(0.2)
+    assert client.get("/workers/w-ttl").json()["alive"] is True
+    time.sleep(0.15)
+    # 刷新窗口用尽：过期行仍可查询，alive 为 false（行不删除）
+    body = client.get("/workers/w-ttl").json()
+    assert body["alive"] is False
+    assert body["capabilities"] == ["gpu"]
+
+
+def test_requires_visible_in_task_views(client):
+    dag = _requires_dag(client, "cap-views")
+    by = {t["key"]: t for t in dag["tasks"]}
+    assert by["plain"]["requires"] == []
+    assert by["gpu"]["requires"] == ["gpu"]
+    assert by["both"]["requires"] == ["gpu", "io"]
+
+    listed = client.get("/tasks", params={"dag_id": "cap-views"}).json()["tasks"]
+    assert {t["key"]: t["requires"] for t in listed} == {
+        "plain": [], "gpu": ["gpu"], "both": ["gpu", "io"],
+    }
+    gpu_id = by["gpu"]["id"]
+    assert client.get(f"/tasks/{gpu_id}").json()["requires"] == ["gpu"]
+
+
+def test_requires_tags_deduped_on_submit(client):
+    dag = submit(client, [{"key": "a", "requires": ["x", "x", "y", "x"]}])
+    assert by_key(dag, "a")["requires"] == ["x", "y"]
+
+
+def test_claim_without_registration_returns_409_and_claims_nothing(client):
+    _requires_dag(client, "cap-409")
+
+    # 即使无能力要求的 plain 排在最前，遇到 requires 候选时登记缺失 -> 409，
+    # 同事务回滚，任何任务（含 plain）都不得被领取
+    for body in ({"limit": 10}, {"worker_id": "ghost", "limit": 10}):
+        r = client.post("/tasks/claim", json=body)
+        assert r.status_code == 409, body
+        err = r.json()["error"]
+        assert err["code"] == "worker_not_registered"
+        assert err["details"]["task_key"] == "gpu"
+        assert err["details"]["requires"] == ["gpu"]
+        assert client.get("/dags/cap-409").json()["states"]["running"] == 0
+
+    # 409 不产生事件
+    events = client.get("/events", params={"dag_id": "cap-409"}).json()["events"]
+    assert [e["type"] for e in events] == ["dag.created"]
+
+
+def test_claim_expired_registration_returns_409(client):
+    _requires_dag(client, "cap-expired")
+    register(client, "w-old", ["gpu"], ttl=0.2)
+    time.sleep(0.25)
+
+    r = client.post("/tasks/claim", json={"worker_id": "w-old", "limit": 10})
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "worker_not_registered"
+    assert client.get("/dags/cap-expired").json()["states"]["running"] == 0
+
+
+def test_claim_matches_capabilities_and_skips_mismatch_to_fill_limit(client):
+    _requires_dag(client, "cap-match")
+    register(client, "w-gpu", ["gpu"], ttl=60)
+
+    # 候选顺序 plain、gpu、both：plain 无要求可领；gpu 被 gpu 覆盖可领；
+    # both 需要 gpu+io，能力不匹配 -> 跳过，不在同批卡住
+    r = client.post("/tasks/claim", json={"worker_id": "w-gpu", "limit": 10})
+    assert r.status_code == 200
+    claimed = {t["task_key"]: t for t in r.json()["claimed"]}
+    assert set(claimed) == {"plain", "gpu"}
+    assert claimed["gpu"]["requires"] == ["gpu"]
+    assert claimed["plain"]["requires"] == []
+
+    # both 仍 pending：同一 worker 再次领取为空（仅剩余不匹配候选）
+    r = client.post("/tasks/claim", json={"worker_id": "w-gpu", "limit": 10})
+    assert r.json()["count"] == 0
+    full = client.get("/dags/cap-match").json()
+    assert full["states"]["running"] == 2
+    assert by_key(full, "both")["state"] == "pending"
+
+    # 补登记 io 能力后 both 可领（重复 PUT 覆盖标签）
+    register(client, "w-gpu", ["gpu", "io"], ttl=60)
+    r = client.post("/tasks/claim", json={"worker_id": "w-gpu", "limit": 10})
+    assert [t["task_key"] for t in r.json()["claimed"]] == ["both"]
+
+
+def test_superset_capabilities_claim_subset_requires(client):
+    submit(client, [{"key": "a", "requires": ["gpu"]}], dag_id="cap-super")
+    register(client, "w-super", ["gpu", "io", "cpu"], ttl=60)
+    r = client.post("/tasks/claim", json={"worker_id": "w-super"})
+    assert r.status_code == 200 and r.json()["count"] == 1
+
+
+def test_capability_tags_are_case_and_space_sensitive(client):
+    submit(client, [{"key": "a", "requires": ["GPU"]}], dag_id="cap-case")
+    register(client, "w-case", ["gpu"], ttl=60)
+    # "gpu" 不覆盖 "GPU"：跳过；没有其他候选 -> 空领取（不是 409，登记存活）
+    assert client.post("/tasks/claim", json={"worker_id": "w-case"}).json()["count"] == 0
+    register(client, "w-case", ["GPU"], ttl=60)
+    assert client.post("/tasks/claim", json={"worker_id": "w-case"}).json()["count"] == 1
+
+
+def test_capability_gate_respects_dependencies(client):
+    submit(
+        client,
+        [
+            {"key": "a"},
+            {"key": "b", "deps": ["a"], "requires": ["gpu"]},
+        ],
+        dag_id="cap-deps",
+    )
+    register(client, "w-gpu", ["gpu"], ttl=60)
+    # a 未完成时 b 不进候选：不触发 409 语义，只领到无要求的 a
+    r = client.post("/tasks/claim", json={"worker_id": "w-gpu", "limit": 10})
+    assert [t["task_key"] for t in r.json()["claimed"]] == ["a"]
+    token = r.json()["claimed"][0]["lease_token"]
+
+    # 完成 a（回报只需有效租约令牌，不校验能力登记）
+    a = next(t for t in client.get("/dags/cap-deps").json()["tasks"] if t["key"] == "a")
+    assert client.post(
+        f"/tasks/{a['id']}/complete",
+        json={"completion_id": "ok-a", "lease_token": token, "success": True},
+    ).status_code == 200
+
+    # 依赖满足后 b 才进入候选并按能力匹配
+    r = client.post("/tasks/claim", json={"worker_id": "w-gpu", "limit": 10})
+    assert [t["task_key"] for t in r.json()["claimed"]] == ["b"]
+
+
+def test_capability_gate_respects_backoff(client):
+    submit(
+        client,
+        [{"key": "a", "max_retries": 2, "requires": ["gpu"],
+          "retry_backoff": {"initial_seconds": 0.3, "multiplier": 1, "max_seconds": 0.3}}],
+        dag_id="cap-backoff",
+    )
+    register(client, "w-gpu", ["gpu"], ttl=60)
+    t = client.post("/tasks/claim", json={"worker_id": "w-gpu"}).json()["claimed"][0]
+    # 显式失败进入退避
+    assert _complete(client, t, "f1", success=False, error="e").status_code == 200
+
+    # 退避未到期：requires 候选不在候选集内——无登记 worker 也不会收到 409，
+    # 登记过期不影响「没有可匹配候选」的空领取
+    assert client.post("/tasks/claim", json={"worker_id": "ghost"}).json()["count"] == 0
+    time.sleep(0.35)
+    # 退避到期后能力门控恢复：无登记 -> 409，有登记 -> 可领
+    r = client.post("/tasks/claim", json={"worker_id": "ghost"})
+    assert r.status_code == 409
+    r = client.post("/tasks/claim", json={"worker_id": "w-gpu"})
+    assert r.json()["claimed"][0]["attempt"] == 2
+
+
+def test_capability_and_concurrency_group_skip_interaction(client):
+    submit(
+        client,
+        [
+            # g 组上限 1，且要求 gpu
+            {"key": "g1", "concurrency_group": "g", "concurrency_limit": 1, "requires": ["gpu"]},
+            {"key": "g2", "concurrency_group": "g", "concurrency_limit": 1},
+            {"key": "u1"},
+        ],
+        dag_id="cap-group",
+    )
+    register(client, "w-cpu", [], ttl=60)  # 存活但无 gpu 能力
+
+    # g1 能力不匹配跳过；g2 占组唯一名额；u1 无组继续领取以填满 limit
+    r = client.post("/tasks/claim", json={"worker_id": "w-cpu", "limit": 10})
+    assert [t["task_key"] for t in r.json()["claimed"]] == ["g2", "u1"]
+
+    # 组已满且 g1 能力不匹配：空领取（不是 409）
+    assert client.post("/tasks/claim", json={"worker_id": "w-cpu", "limit": 10}).json()["count"] == 0
+
+    # 有 gpu 能力的新 worker：组仍被 g2 占满，g1 因组满跳过 -> 空
+    register(client, "w-gpu", ["gpu"], ttl=60)
+    assert client.post("/tasks/claim", json={"worker_id": "w-gpu", "limit": 10}).json()["count"] == 0
+
+
+def test_unclaimed_due_to_missing_capability_can_be_claimed_after_upgrade(client):
+    submit(client, [{"key": "a", "requires": ["gpu", "io"]}], dag_id="cap-upgrade")
+    register(client, "w-1", ["gpu"], ttl=60)
+    assert client.post("/tasks/claim", json={"worker_id": "w-1"}).json()["count"] == 0
+    # 任务保持 pending，未产生租约/尝试
+    task = client.get("/dags/cap-upgrade").json()["tasks"][0]
+    assert task["state"] == "pending" and task["attempt"] == 0
+    assert client.get(f"/tasks/{task['id']}").json()["attempts"] == []
+
+    register(client, "w-1", ["gpu", "io"], ttl=60)
+    r = client.post("/tasks/claim", json={"worker_id": "w-1"})
+    assert r.json()["count"] == 1 and r.json()["claimed"][0]["attempt"] == 1
+
+
+def test_no_requires_tasks_keep_legacy_claim_behavior(client):
+    # 未声明 requires 的历史任务：匿名、无登记、过期登记 worker 均可领取
+    submit(client, [{"key": "a"}, {"key": "b"}], dag_id="cap-legacy")
+    register(client, "w-exp", ["gpu"], ttl=0.2)
+    time.sleep(0.25)
+
+    assert len(client.post("/tasks/claim", json={"limit": 10}).json()["claimed"]) == 2
+    # 直接调服务层重置候选较复杂：另起一个无 requires DAG 验证过期登记 worker
+    submit(client, [{"key": "a"}, {"key": "b"}], dag_id="cap-legacy-2")
+    r = client.post("/tasks/claim", json={"worker_id": "w-exp", "dag_id": "cap-legacy-2", "limit": 10})
+    assert r.status_code == 200 and r.json()["count"] == 2
+
+
+def test_empty_capabilities_worker_claims_only_plain_tasks(client):
+    submit(client, [{"key": "a"}, {"key": "b", "requires": ["gpu"]}], dag_id="cap-empty")
+    register(client, "w-empty", [], ttl=60)
+    r = client.post("/tasks/claim", json={"worker_id": "w-empty", "limit": 10})
+    assert [t["task_key"] for t in r.json()["claimed"]] == ["a"]
+    # b 需要 gpu：空能力集合不覆盖 -> 再次领取为空
+    assert client.post("/tasks/claim", json={"worker_id": "w-empty"}).json()["count"] == 0
+
+
+def test_lease_reclaim_after_expiry_also_checks_capability_registration(client):
+    submit(client, [{"key": "a", "lease_seconds": 0.2, "requires": ["gpu"]}], dag_id="cap-reclaim")
+    register(client, "w-1", ["gpu"], ttl=10)
+    t1 = client.post("/tasks/claim", json={"worker_id": "w-1"}).json()["claimed"][0]
+    time.sleep(0.25)
+
+    # 租约过期后重领：无登记 -> 409（任务虽 running+租约过期，仍是 requires 候选）
+    assert client.post("/tasks/claim", json={}).status_code == 409
+    # 原 worker 登记仍存活：可重领，attempt=2
+    t2 = client.post("/tasks/claim", json={"worker_id": "w-1"}).json()["claimed"][0]
+    assert t2["task_id"] == t1["task_id"] and t2["attempt"] == 2
+
+    # worker 登记也过期后：租约过期重领同样 409
+    time.sleep(11)
+    r = client.post("/tasks/claim", json={"worker_id": "w-1"})
+    assert r.status_code == 409
+    assert client.get("/dags/cap-reclaim").json()["states"]["running"] == 1  # t2 未被改动
+
+
+def test_409_when_requires_candidate_only_behind_full_group(client):
+    """requires 候选在并发组满时不进可领取集合：无登记领取不触发 409（与门控优先级一致）。"""
+    submit(
+        client,
+        [
+            {"key": "holder", "concurrency_group": "g", "concurrency_limit": 1},
+            {"key": "need", "concurrency_group": "g", "concurrency_limit": 1, "requires": ["gpu"]},
+        ],
+        dag_id="cap-gate-order",
+    )
+    register(client, "w-1", [], ttl=60)
+    # w-1 先占满组
+    assert [t["task_key"] for t in
+            client.post("/tasks/claim", json={"worker_id": "w-1", "limit": 10}).json()["claimed"]] == ["holder"]
+    # 匿名再来：holder 运行中、need 被组满挡住（没有可领取候选）——空领取而非 409
+    assert client.post("/tasks/claim", json={"limit": 10}).json()["count"] == 0
+
+
+def test_worker_registration_and_requires_persist_across_restart(tmp_path, monkeypatch):
+    db_file = tmp_path / "workers.db"
+    monkeypatch.setenv("DB_PATH", str(db_file))
+    monkeypatch.setenv("DEFAULT_LEASE_SECONDS", "30")
+
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    with TestClient(app) as c1:
+        register(c1, "w-persist", ["gpu", "io"], ttl=300)
+        submit(c1, [{"key": "a", "requires": ["gpu", "io"]}], dag_id="cap-restart")
+        claimed = c1.post("/tasks/claim", json={"worker_id": "w-persist"}).json()["claimed"]
+        assert len(claimed) == 1
+
+    with TestClient(app) as c2:
+        # 登记、TTL 与 requires 持久化：重启后仍存活、仍按能力路由
+        w = c2.get("/workers/w-persist").json()
+        assert w["alive"] is True and w["capabilities"] == ["gpu", "io"]
+        assert by_key(c2.get("/dags/cap-restart").json(), "a")["requires"] == ["gpu", "io"]
+        # a 已在 running，无新候选
+        assert c2.post("/tasks/claim", json={"worker_id": "w-persist"}).json()["count"] == 0
+        # 未登记 worker 无法在 a 租约过期后重领（用短租约场景另验）
+        submit(c2, [{"key": "b", "requires": ["gpu"]}], dag_id="cap-restart-2")
+        r = c2.post("/tasks/claim", json={"worker_id": "nobody"})
+        assert r.status_code == 409
+
+
+def test_legacy_sqlite_db_gets_requires_null_and_claims_normally(tmp_path, monkeypatch):
+    """旧库（无 requires 列、无 workers 表）迁移后：历史任务 requires 为空、领取行为不变。"""
+    import sqlite3
+
+    db_file = tmp_path / "legacy-cap.db"
+    conn = sqlite3.connect(db_file)
+    conn.executescript(
+        """
+        CREATE TABLE dags (id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL);
+        CREATE TABLE concurrency_groups (name TEXT PRIMARY KEY, limit_value INTEGER NOT NULL,
+            created_at TEXT NOT NULL);
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY, dag_id TEXT NOT NULL, task_key TEXT NOT NULL, name TEXT NOT NULL,
+            payload TEXT, max_retries INTEGER NOT NULL DEFAULT 0, lease_seconds REAL NOT NULL,
+            duration_seconds REAL NOT NULL DEFAULT 1, state TEXT NOT NULL, blocked_reason TEXT,
+            lease_token TEXT, lease_expires_at TEXT, worker_id TEXT, attempt INTEGER NOT NULL DEFAULT 0,
+            failure_count INTEGER NOT NULL DEFAULT 0,
+            backoff_initial_seconds REAL, backoff_multiplier REAL, backoff_max_seconds REAL,
+            next_eligible_at TEXT, created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
+            concurrency_group TEXT,
+            UNIQUE(dag_id, task_key));
+        CREATE TABLE dependencies (dag_id TEXT, task_key TEXT, dep_key TEXT,
+            PRIMARY KEY (dag_id, task_key, dep_key));
+        CREATE TABLE attempts (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, attempt_no INTEGER,
+            lease_token TEXT UNIQUE, worker_id TEXT, leased_at TEXT, expires_at TEXT,
+            heartbeat_at TEXT, state TEXT, error TEXT);
+        CREATE TABLE completions (
+            task_id TEXT NOT NULL, completion_id TEXT NOT NULL, lease_token TEXT NOT NULL,
+            success INTEGER NOT NULL, fingerprint TEXT NOT NULL, status_code INTEGER NOT NULL,
+            response_body TEXT NOT NULL, created_at TEXT NOT NULL,
+            PRIMARY KEY (task_id, completion_id));
+        CREATE TABLE events (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT, event_type TEXT NOT NULL,
+            dag_id TEXT NOT NULL, task_id TEXT, attempt INTEGER, from_state TEXT,
+            to_state TEXT, next_eligible_at TEXT, occurred_at TEXT NOT NULL);
+        INSERT INTO dags VALUES ('d1', 'old', '2026-01-01T00:00:00Z');
+        INSERT INTO tasks (id, dag_id, task_key, name, max_retries, lease_seconds, state,
+                           attempt, created_at)
+        VALUES ('t1', 'd1', 'a', 'a', 0, 30, 'pending', 0, '2026-01-01T00:00:00Z');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setenv("DB_PATH", str(db_file))
+    from app.db import init_db
+    from app import service
+
+    init_db()
+    init_db()  # 迁移幂等
+
+    # 历史任务 requires 为空，匿名/无登记照常领取（兼容行为）
+    assert service.get_task("t1")["requires"] == []
+    t = service.claim_tasks(None, None, 1)["claimed"][0]
+    assert t["task_id"] == "t1" and t["requires"] == []
+
+    # 迁移后能力登记可直接使用
+    reg = service.register_worker("w-new", {"capabilities": ["gpu"], "ttl_seconds": 30})
+    assert reg["alive"] is True
+    assert service.get_worker("w-new")["capabilities"] == ["gpu"]
+    with pytest.raises(service.APIError) as exc:
+        service.get_worker("missing")
+    assert exc.value.status_code == 404
+
+
+def test_worker_endpoints_in_openapi(client):
+    spec = client.get("/openapi.json").json()
+    paths = spec["paths"]
+    assert "put" in paths["/workers/{worker_id}"]
+    assert "get" in paths["/workers/{worker_id}"]
+    put_op = paths["/workers/{worker_id}"]["put"]
+    get_op = paths["/workers/{worker_id}"]["get"]
+    assert "200" in put_op["responses"] and "200" in get_op["responses"]
+    assert "404" in get_op["responses"]
+    claim = paths["/tasks/claim"]["post"]
+    assert "409" in claim["responses"]

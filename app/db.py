@@ -66,6 +66,18 @@ def init_db(path: Path | None = None) -> None:
                 created_at    TEXT NOT NULL
             );
 
+            -- 工作器能力登记（能力路由）：worker_id 即主键。
+            -- capabilities 为去重后的能力标签 JSON 数组（按首次出现顺序持久化）；
+            -- expires_at 为登记过期时刻，过期前该 worker_id 的领取才视为携带存活登记。
+            -- 重复 PUT 覆盖 capabilities 并刷新 expires_at（registered_at 保留首次值）。
+            CREATE TABLE IF NOT EXISTS workers (
+                worker_id      TEXT PRIMARY KEY,
+                capabilities   TEXT NOT NULL,       -- JSON 数组字符串，可能为 []
+                ttl_seconds    REAL NOT NULL CHECK (ttl_seconds > 0),
+                registered_at  TEXT NOT NULL,       -- 首次登记时刻
+                expires_at     TEXT NOT NULL        -- 最近一次 PUT 刷新后的过期时刻
+            );
+
             CREATE TABLE IF NOT EXISTS tasks (
                 id                  TEXT PRIMARY KEY,
                 dag_id              TEXT NOT NULL REFERENCES dags(id),
@@ -100,6 +112,13 @@ def init_db(path: Path | None = None) -> None:
                 -- 跨 DAG 并发组：NULL 表示不限流；非空时全库同名组内未过期
                 -- running 租约数不得超过 concurrency_groups 中持久化的上限。
                 concurrency_group   TEXT REFERENCES concurrency_groups(name),
+                -- 能力要求：JSON 数组（去重后的能力标签，按首次出现顺序持久化）；
+                -- NULL 表示不要求能力（历史任务与未声明 requires 的任务），
+                -- 任何 worker_id（含无登记/匿名）均可领取，兼容历史行为。
+                -- 非空时只有携带存活能力登记、且 capabilities 覆盖全部标签的
+                -- worker_id 才能领取；能力不匹配的候选被跳过继续填满 limit，
+                -- 登记缺失/过期则整次领取 409 且不领取任何任务。
+                requires            TEXT,
                 UNIQUE(dag_id, task_key)
             );
 
@@ -230,6 +249,10 @@ def init_db(path: Path | None = None) -> None:
             conn.execute("ALTER TABLE tasks ADD COLUMN backoff_max_seconds REAL")
         if "next_eligible_at" not in columns:
             conn.execute("ALTER TABLE tasks ADD COLUMN next_eligible_at TEXT")
+        # 旧库迁移：为已有任务补齐能力要求列。历史任务均未声明 requires，
+        # 默认 NULL —— 行为与新增的无能力要求任务一致，兼容现有领取。
+        if "requires" not in columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN requires TEXT")
         conn.execute(
             """CREATE INDEX IF NOT EXISTS idx_tasks_group_occupancy
                    ON tasks(concurrency_group)

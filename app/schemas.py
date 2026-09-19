@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, Any
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -44,6 +44,10 @@ class TaskIn(BaseModel):
         None,
         ge=1,
         description="同名组全局未过期 running 租约数上限（正整数）；须与 concurrency_group 同时提供",
+    )
+    requires: list[Annotated[str, Field(min_length=1)]] = Field(
+        default_factory=list,
+        description="能力要求标签列表：只有携带存活登记且覆盖全部标签的 worker_id 可领取；缺省/空数组表示不要求能力",
     )
 
     @model_validator(mode="after")
@@ -111,4 +115,19 @@ class SubscriptionAckIn(BaseModel):
         ...,
         min_length=1,
         description="poll 返回的当前批次随机令牌；仅当前令牌可把游标推进到该批最后一条 sequence",
+    )
+
+
+class WorkerRegisterIn(BaseModel):
+    """工作器能力登记：去重的能力标签 + 正数 ttl_seconds；重复 PUT 覆盖并续期。"""
+
+    capabilities: list[Annotated[str, Field(min_length=1)]] = Field(
+        ...,
+        description="能力标签列表（标签须为非空字符串；服务端按首次出现顺序去重持久化）",
+    )
+    ttl_seconds: float = Field(
+        ...,
+        gt=0,
+        allow_inf_nan=False,
+        description="登记存活时长（秒，必须为正）：过期前该 worker_id 的领取才视为携带存活登记；重复登记会刷新过期时刻",
     )
